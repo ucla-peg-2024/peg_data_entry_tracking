@@ -1,0 +1,2064 @@
+## ---------------------------
+##
+## Script name: peg3_data_entry_tracking.R
+##
+## Purpose of script: To track the data entry status of PEG3 study
+##
+## Author: Yufan Gong
+##
+## Date Created: 2024-02-05
+##
+## Copyright (c) Yufan Gong, 2024
+## Email: ivangong@ucla.edu
+##
+## ---------------------------
+##
+## Notes: The following code is assuming that you are using Windows OS. 
+##        Make sure you have read this post before you run the code:
+##        https://rpubs.com/vermanica/SQL_finalProject_MicrosoftAccess
+##        If you are using Mac OS, please check this link for .accdb connection:
+##        https://github.com/ethoinformatics/r-database-connections/blob/master/
+##        And please make sure .accbd doesn't have a password if you are using
+##        Mac OS.
+##        For other database types, please refer to this blog:
+##        https://ryanpeek.org/2019-09-17-reading-databases-in-r/
+## ---------------------------
+
+# Load libraries ----------------------------------------------------------
+
+
+library(readxl)
+library(here)
+library(rlang)
+library(magrittr)
+library(arsenal)
+library(lubridate)
+library(RODBC)
+library(labelled)
+library(haven)
+library(glue)
+library(ggpubr)
+library(ggthemes)
+library(tidyverse)
+
+`%notin%` <- Negate(`%in%`)
+
+  
+# Connect to the database -------------------------------------------------
+
+
+list("case_contact_manager", "case_entry1", 
+     "hhctrl_contact_manager", "hhctrl_entry1", 
+     "popctrl_contact_manager", "popctrl_entry1") %>% 
+  map(function(data){
+    odbcConnect(dsn = data, pwd = "youknowwhatitis")
+  }) %>% 
+  set_names("channel_peg3case_cm", "channel_peg3case_e1",
+            "channel_peg3hhctrl_cm", "channel_peg3hhctrl_e1",
+            "channel_peg3popctrl_cm", "channel_peg3popctrl_e1") %>% 
+  list2env(.GlobalEnv)
+
+
+# Read in data ------------------------------------------------------------
+
+#grab tbls interested
+
+tbl_drop_e1 <- c(glue("(?i)main_part_{letters[2:9]}"), "part_e_2", "part_f2",
+              "tbllist", "list_", "list -", "DSQlogin", "backup", "mainswitch",
+              "scopa", "5min", "_old", "navigation", "meddx", "medm", "medw",
+              "medo", "supplement", "test", "sub", "antibiotics_1", 
+              "antibiotics_2", "mini mental", "pd_screening")
+
+list(channel_peg3case_e1, channel_peg3hhctrl_e1, channel_peg3popctrl_e1) %>% 
+  map(function(channel){
+    sqlTables(channel)$TABLE_NAME %>% 
+      grep("tbl_peg3", x=., 
+           value = TRUE, ignore.case = TRUE) %>% 
+      discard(~str_detect(.x, paste(tbl_drop_e1, collapse = "|(?i)")))
+  }) %>% 
+  set_names("list_tbl_case_e1", "list_tbl_hhctrl_e1",
+            "list_tbl_popctrl_e1") %>% 
+  list2env(.GlobalEnv)
+
+
+
+list(channel_peg3case_cm, channel_peg3hhctrl_cm, channel_peg3popctrl_cm) %>% 
+  map(function(channel){
+    sqlTables(channel)$TABLE_NAME %>% 
+      grep("patientdetail|ctrldetail|checkra|screening|recruitment|peg3_fecal|demo|cpdr|visit2", x = ., 
+           value = TRUE, ignore.case = TRUE) %>% 
+      discard(~str_detect(
+        .x, "(?i)copy|checkra2|tbllist|stool|_0|sample|old|tracking|test|diff|patients_cpdr"))
+  }) %>% 
+  set_names("list_tbl_case_cm", "list_tbl_hhctrl_cm",
+            "list_tbl_popctrl_cm") %>% 
+  list2env(.GlobalEnv)
+
+
+#read in all tbls in the database and do basic cleaning
+
+var_keep <- c("pegid", "mailid", "entered", "entry", "enter", "collect", 
+              "initial", "interviewer", "inputby", 
+              "mail_status", "mailstatus", "consent_date", 
+              "enroll_date", "screeningstatus", "finalstatus",
+              "parkinsondisease", "msastatus", "peg3status1", "ra_consent", 
+              "RA_MainLifeHistoryQuestion", "RA_MoCA_status", "RA_PDMedNo",
+              "RA_PDMedLastDose", "sex", "msa", "willinganswerdemo",
+              "RA_PDMedCheck_status", "RA_MedicalCheck_status",
+              "RA_GDS_status", "RA_QualityofLife_status", "RA_Timeline_status",
+              "RA_PatientQuestion_status", "RA_Constipation_status", 
+              "RA_Bristol_status", "RA_Antibiotics_status", "RA_Diet_status",
+              "RA_Zarit_status", "RA_Blood", "RA_Stool", "IncidentID_Index",
+              "bloodstatus", "stoolstatus", "phys_apptdate_status", "a3")
+var_drop <- c("collected1", "date1", "initials1", "pdmsastatus", 
+              "bloodcenter", "abletoenter", "wgs", "sleep_enter", 
+              "cleaned_data", "sleep_collected_date", "hscore_collected_date",
+              "phys_apptdate_status2", "mainlifehistoryquestion_date", 
+              "lastdose_", "blooddate", "bloodno", "stooldate", "stoolno",
+              "mail_status_date", "returned", "refused", "interested", "reply",
+              "reason", "mailstatus1date", "mailstatus2date", "mailstatus3date")
+entryinitial_todetect <- c("entered_initial", "enteredby", "entry_initial")
+entrydate_todetect <- c("entered_date", "date_entered", "entry_date")
+collectdate_todetect <- c("collected_date", "date_collected", "collect_date", 
+                          "bs_check_date")
+
+
+list(
+  list(list_tbl_case_e1, list_tbl_hhctrl_e1, list_tbl_popctrl_e1, 
+       list_tbl_case_cm, list_tbl_hhctrl_cm, list_tbl_popctrl_cm),
+  list(channel_peg3case_e1, channel_peg3hhctrl_e1, channel_peg3popctrl_e1,
+       channel_peg3case_cm, channel_peg3hhctrl_cm, channel_peg3popctrl_cm),
+  list("case_e1", "hhctrl_e1", "popctrl_e1",
+       "case_cm", "hhctrl_cm", "popctrl_cm")
+) %>% 
+  pmap(function(data1, data2, data3){
+    data1 %>% 
+      map(function(data){
+        sqlQuery(data2,
+                 glue::glue("select * from [{data}];")) %>% 
+          as_tibble() %>% 
+          select(-matches(paste(var_drop, sep = "|"),
+                          ignore.case = TRUE)) %>%
+          select(matches(paste(var_keep, sep = "|"),
+                         ignore.case = TRUE)) %>%
+          # modify_at(vars(contains("date")), ymd) %>% 
+          mutate_at(vars(matches("date", ignore.case = TRUE)), as.character) %>%
+          #rename(pegid = PEGID) %>%
+          rename_all(str_to_lower) %>% 
+          rename_with(~replace(.x, str_detect(.x, 
+                                              paste(entryinitial_todetect, 
+                                                    collapse = "(?i)|")), 
+                               "entry_initial"), 
+                      contains(entryinitial_todetect)) %>%
+          rename_with(~replace(.x, str_detect(.x, 
+                                              paste(entrydate_todetect, 
+                                                    collapse = "(?i)|")), 
+                               "entry_date"), 
+                      contains(entrydate_todetect)) %>%
+          rename_with(~replace(.x, str_detect(.x, 
+                                              paste(collectdate_todetect, 
+                                                    collapse = "(?i)|")), 
+                               "collect_date"), 
+                      contains(collectdate_todetect)) %>%
+          rename_with(~replace(.x, str_detect(.x, "(?i)mainlifehistory"), 
+                               "ra_mainlifehistory_status"), 
+                      contains("mainlifehistory")) %>%
+          rename_with(~replace(.x, str_detect(.x, "(?i)pdmedno"), 
+                               "ra_pdmedno_status"), 
+                      contains("pdmedno")) %>%
+          rename_with(~replace(.x, str_detect(.x, "(?i)pdmedlastdose"), 
+                               "ra_pdmedlastdose_status"), 
+                      contains("pdmedlastdose")) %>%
+          mutate_at(vars(starts_with("ra_")), as.character) %>%
+          # mutate_if(is.character, ~ str_remove_all(.x," ")) %>%
+          # mutate_if(is.character, toupper) %>% 
+          mutate_if(is.character, ~ replace(.x, .x %in% list(""), NA)) %>% 
+          mutate_at(vars(starts_with("ra_")), ~ case_when(. == "0" ~ NA,
+                                . == "1" ~ "Completed",
+                                TRUE ~ as.character(.))) %>% 
+          # filter(pegid %notin% c("G00001SA", "G00001SB", "G00001SC", 
+          #                        "1XXXXXXXX", "G10000SW", "G10007SW",
+          #                        "g10051LL70", "G20381DD32",
+          #                        "777", "456", "123")) %>% 
+          # filter(str_length(pegid) > 3) %>%
+          distinct()
+      }) %>%
+      set_names(paste(data1, data3, sep = "_")) %>% 
+      list2env(.,envir = .GlobalEnv)
+  })
+
+list.dirs(here(),recursive = FALSE) %>%
+  list.files("\\.csv$", full.names = TRUE, recursive = T) %>%
+  grep("form_completion",., value=TRUE, ignore.case = TRUE) %>%
+  map(read_csv) %>%
+  set_names(
+    "tbl_cgep_form_completion",
+    "tbl_oldhhctrl_form_completion",
+    "tbl_peg2_form_completion"
+  ) %>%
+  list2env(envir = .GlobalEnv)
+
+# Data cleaning -----------------------------------------------------------
+
+#### old form entry clean
+
+list(tbl_peg2_form_completion, tbl_oldhhctrl_form_completion, 
+     tbl_cgep_form_completion) %>% 
+  map(function(data){
+    data %>% 
+      rename(moca_old = mmse_old) %>% 
+      mutate_all(~replace(.x, .x %in% list("Entry completed"), 
+                          "Entered in old database"))
+  }) %>% 
+  set_names("tbl_peg2_form_completion", "tbl_oldhhctrl_form_completion", 
+            "tbl_cgep_form_completion") %>%
+  list2env(.GlobalEnv)
+
+## add `refused demographics` category
+
+#### Stool sample id clean ####
+
+list(tbl_PEG3_Fecal_case_cm, tbl_PEG3_Fecal_hhctrl_cm, 
+     tbl_PEG3_Fecal_popctrl_cm) %>% 
+  map(function(data){
+    data %>% 
+      mutate(
+        pegid = case_when(
+          pegid == "G21477XXXX" ~ "G21477",
+          pegid == "G20608WN59" ~ "G20608WN49",
+          TRUE ~ pegid
+        )
+      ) %>% 
+      filter(str_length(pegid) >= 5)
+  }) %>% 
+  set_names("tbl_PEG3_Fecal_case_cm", "tbl_PEG3_Fecal_hhctrl_cm", 
+            "tbl_PEG3_Fecal_popctrl_cm") %>%
+  list2env(.GlobalEnv)
+
+list(
+  list("G1|G2|8|1", "G4|7", "G6|G7|G8|2|3|4|5|6"),
+  list("case", "hhctrl", "popctrl"),
+  list(tbl_PEG3_Fecal_case_cm, tbl_PEG3_Fecal_hhctrl_cm, 
+       tbl_PEG3_Fecal_popctrl_cm)
+) %>% 
+  pmap(function(x, y, data){
+    data %>% 
+      filter(str_starts(pegid, x)) %>% 
+      mutate(type = y)
+  }) %>% 
+  set_names("tbl_peg3_fecal_case", "tbl_peg3_fecal_hhctrl", 
+            "tbl_peg3_fecal_popctrl") %>%
+  list2env(.GlobalEnv)
+
+#### screening form clean ####
+
+
+tbl_PEG3_Screening_clean_case_cm <- tbl_PEG3_Screening_case_cm %>% 
+  mutate(mail_status = case_when(
+    rowSums(across(starts_with("mail_status"), ~ . %in% c("Deceased", "Refused"))) > 0 ~ "Deceased/Refused at mailing",
+    rowSums(across(starts_with("mail_status"), ~ . %in% c("Interested"))) > 0 & 
+      is.na(screeningstatus) ~ "Interested at mailing, pending screening",
+    # !is.na(screeningstatus)|!is.na(screeningstatus2) ~ "Screened",
+    screeningstatus == 0 | screeningstatus2 == 0 ~ "Unable to contact",
+    TRUE ~ NA_character_
+  )) %>% 
+  filter(!is.na(mail_status) | !is.na(screeningstatus) | !is.na(screeningstatus2) | !is.na(enroll_date))
+
+
+tbl_PEG3_Screening_clean_popctrl_cm <- tbl_popH_recruitment_combined_popctrl_cm %>% 
+  mutate(mail_status = case_when(
+    rowSums(across(starts_with("mailstatus"), ~ . %in% c(20))) > 0  ~ "Ineligible at mailing",
+    rowSums(across(starts_with("mailstatus"), ~ . %in% c(8,9,13,17))) > 0 ~ "Refused at mailing",
+    rowSums(across(starts_with("mailstatus"), ~ . %in% c(11, 15, 19))) > 0 & 
+      is.na(screeningstatus) ~ "Interested at mailing, pending screening",
+    # !is.na(screeningstatus)|!is.na(screeningstatus2) ~ "Screened",
+    screeningstatus == 0 | screeningstatus2 == 0 ~ "Unable to contact",
+    TRUE ~ NA_character_
+  )) %>% 
+  filter(!is.na(mail_status) | !is.na(screeningstatus) | !is.na(screeningstatus2) | !is.na(enroll_date))
+
+tbl_PEG3_Screening_clean_hhctrl_cm <- tblScreening_hhctrl_cm %>% 
+  filter(!is.na(screeningstatus) | !is.na(screeningstatus2) | str_length(pegid) > 5 | !is.na(enroll_date))
+
+tbl_PEG3_Screening_clean_filtered_case_cm <- tbl_PEG3_Screening_clean_case_cm %>% 
+  filter((mail_status %notin% c("Unable to contact", "Interested at mailing, pending screening") 
+         & screeningstatus %notin% c(12, 13)) | pegid %in% tbl_peg3_fecal_case$pegid) %>% 
+  filter(mailid %notin% "1xxxxx")
+
+# setdiff(tbl_peg3_fecal_case$pegid, tbl_PEG3_PatientDetail_case_cm$pegid)
+
+tbl_PEG3_Screening_clean_filtered_popctrl_cm <- tbl_PEG3_Screening_clean_popctrl_cm %>%
+  filter(mail_status %notin% c("Unable to contact", "Interested at mailing, pending screening",
+                               "Refused at mailing", "Ineligible at mailing") 
+         & screeningstatus %notin% c(12, 13))
+
+
+##### General visualization #####
+
+
+
+tbl_PEG3_Screening_clean_filtered_case_cm %>% 
+  mutate(elig_status = if_else(screeningstatus %in% c(15, 10, 11), "Eligible", "Ineligible")) %>%
+  ggplot(aes(x = elig_status, fill = elig_status)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), 
+            position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("Eligible" = "#8BC496",
+                               "Ineligible" = "#CEC289"))+
+  labs(title = str_c(Sys.Date(), " ", "Screening status for PEG3 cases"),
+       x = "Screening status",
+       y = "Count") +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    plot.title = element_text(size = 12, hjust = 0.5)
+  )
+
+## screening status for cases
+
+list("Eligible", "Ineligible") %>% 
+  map(function(x){
+    tbl_PEG3_Screening_clean_filtered_case_cm %>% 
+      set_value_labels(
+        screeningstatus = c(
+          "Unable to contact" = 0,
+          "No PD" = 1, 
+          "Dx<=2015" = 2, 
+          "Not lived in Fresno, Kern or Tulare" = 3,
+          "lived in California < 5 years" = 4,
+          "Deceased" = 5,
+          "Cognitive condition" = 6,
+          "Too ill" = 7,
+          "Institutionalized" = 8,
+          "Already in PEG" = 9,
+          "Proxy Refusal -- Eligible" = 10,
+          "Refused -- Eligible" = 11,
+          "Proxy Refusal -- Unknown Eligibility" = 12,
+          "Refused -- Unknown Eligibility" = 13,
+          "Unable to communicate" = 14,
+          "Eligible" = 15
+        )) %>% 
+      mutate_if(is.labelled, to_factor) %>%
+      mutate(elig_status = if_else(str_detect(screeningstatus, "(?i)eligible"), 
+                                   "Eligible", "Ineligible")) %>% 
+      filter(elig_status == x) %>%
+      ggplot(aes(x = screeningstatus)) +
+      geom_bar(fill = "lightblue") +
+      geom_text(stat = "count", aes(label = after_stat(count)), 
+                position = position_stack(vjust = 0.5)) +
+      labs(title = str_c(Sys.Date(), " ", x, " cases' screening status tracking"),
+           x = "Screening status",
+           y = "Count") +
+      theme_classic() +
+      theme(
+        axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 12, hjust = 0.5)
+      )
+  }) %>% 
+  set_names("Eligible cases", "Ineligible cases")
+
+tbl_PEG3_Screening_clean_filtered_case_cm %>% 
+  set_value_labels(
+    screeningstatus = c(
+      "Unable to contact" = 0,
+      "No PD" = 1, 
+      "Dx<=2015" = 2, 
+      "Not lived in Fresno, Kern or Tulare" = 3,
+      "lived in California < 5 years" = 4,
+      "Deceased" = 5,
+      "Cognitive condition" = 6,
+      "Too ill" = 7,
+      "Institutionalized" = 8,
+      "Already in PEG" = 9,
+      "Proxy Refusal -- Eligible" = 10,
+      "Refused -- Eligible" = 11,
+      "Proxy Refusal -- Unknown Eligibility" = 12,
+      "Refused -- Unknown Eligibility" = 13,
+      "Unable to communicate" = 14,
+      "Eligible" = 15
+    )) %>% 
+  mutate_if(is.labelled, to_factor) %>%
+  mutate(elig_status = if_else(str_detect(screeningstatus, "(?i)eligible"), 
+                               "Eligible", "Ineligible")) %>% 
+  filter(elig_status == "Eligible") %>% 
+  filter(pegid %in% tbl_PEG3_Fecal_case_cm$pegid) %>% 
+  nrow()
+
+
+
+#### collection date distribution of stool samples ####
+list(
+  list(tbl_peg3_fecal_case, tbl_peg3_fecal_hhctrl, tbl_peg3_fecal_popctrl),
+  list("cases", "hhctrls", "popctrls")
+) %>% 
+  pmap(function(data, x){
+    data %>% 
+      mutate(collect_date = ymd(collect_date)) %>% 
+      ggplot(aes(x = collect_date)) +
+      geom_histogram(fill = "lightblue", bins = 20) +
+      labs(title = str_c(Sys.Date(), " ", "Stool samples collection date distribution in ", x),
+           x = "Collection date",
+           y = "Count") +
+      theme_classic() +
+      theme(
+        axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 12, hjust = 0.5)
+      )
+  }) %>% 
+  set_names("case", "hhctrl", "popctrl")
+
+list(tbl_peg3_fecal_case, tbl_peg3_fecal_hhctrl, 
+  tbl_peg3_fecal_popctrl) %>% 
+  bind_rows() %>% 
+  mutate(collect = if_else(collect_date >= "2020-01-01", "Collected after 2020", 
+                           "Collected before 2020")) %>% 
+  ggplot(aes(x = type, fill = collect)) +
+  geom_bar(position = "dodge") +
+  geom_text(stat = "count", aes(label = after_stat(count)), 
+            position = position_dodge(width = 1), vjust = -0.2) +
+  scale_fill_brewer()+
+  labs(title = str_c(Sys.Date(), " ", "Stool samples collection distribution by case/control types"),
+       x = "Type",
+       y = "Count",
+       fill = "Collect date") +
+  theme_classic() +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    plot.title = element_text(size = 12, hjust = 0.5)
+  )
+
+list(
+  list(tbl_peg3_fecal_case, tbl_peg3_fecal_hhctrl, 
+       tbl_peg3_fecal_popctrl),
+  list(tbl_PEG3_PatientDetail_case_cm, tbl_PEG3_HHctrlDetail_hhctrl_cm,
+       tbl_PEG3_PopctrlDetail_popctrl_cm)
+) %>%
+  pmap(function(data1, data2){
+    data1 %>% 
+      mutate(inpeg3 = if_else(pegid %in% data2$pegid, "In PEG3", "Not in PEG3"))
+  }) %>% 
+  bind_rows() %>% 
+  select(-collect_date) %>% 
+  distinct() %>% 
+  ggplot(aes(x = type, fill = inpeg3)) +
+  geom_bar(position = "dodge") +
+  geom_text(stat = "count", aes(label = after_stat(count)), 
+            position = position_dodge(width = 1), vjust = -0.2) +
+  scale_fill_brewer()+
+  labs(title = str_c(Sys.Date(), " ", "Stool samples collection distribution (unique ids)"),
+       x = "Type",
+       y = "Count",
+       fill = "In PEG3 database") +
+  theme_classic() +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    plot.title = element_text(size = 12, hjust = 0.5)
+  )
+
+tbl_PEG3_Demographic_case_cm <- tbl_PEG3_Demographic_case_cm %>% 
+  left_join(tbl_PEG3_Screening_clean_filtered_case_cm %>% 
+              select(pegid,sex), by = "pegid")
+
+tbl_PEG3_Demographic_hhctrl_cm <- tbl_PEG3_Screening_clean_hhctrl_cm %>% 
+  select(pegid:collect_initial, sex)
+
+tbl_PEG3_Demographic_popctrl_cm <- tbl_PEG3_Screening_clean_filtered_popctrl_cm %>% 
+  select(pegid:collect_initial, sex)
+
+#### demographic information check ####
+tbl_peg3_demo_entry_nomailid_case <- tbl_PEG3_Screening_clean_filtered_case_cm %>% 
+  filter(is.na(mailid)) %>% 
+  select(-c(entry_date, entry_initial, collect_date, collect_initial, starts_with("a3"), sex)) %>%
+  left_join(tbl_PEG3_Demographic_case_cm %>% 
+              select(-mailid), by = "pegid") %>%
+  mutate(
+    demo_entry_status = case_when(
+      !is.na(entry_initial) & !is.na(entry_date) ~ "Entry completed",
+      is.na(entry_initial) & !is.na(entry_date) ~ "Entry initial needed",
+      !is.na(entry_initial) & is.na(entry_date) ~ "Entry date needed",
+      is.na(entry_initial) & is.na(entry_date) 
+      & (!is.na(collect_initial) | !is.na(collect_date)) ~ "Entry needed",
+      is.na(entry_initial) & is.na(entry_date) 
+      & is.na(collect_initial) & is.na(collect_date) 
+      & !is.na(incidentid_index) & screeningstatus == 9 
+      & !str_starts(pegid, "G") ~ "In peg1/peg2/prog",
+      is.na(entry_initial) & is.na(entry_date) 
+      & is.na(collect_initial) & is.na(collect_date) 
+      & !is.na(incidentid_index) & screeningstatus != 9 
+      & str_starts(pegid, "G") ~ "In CPDR",
+      TRUE ~ "pending"),
+    type = if_else(str_starts(pegid, "G"), "baseline", "prog")
+  ) 
+
+tbl_peg3_demo_entry_withmailid_case <- tbl_PEG3_Screening_clean_filtered_case_cm %>% 
+  filter(!is.na(mailid)) %>% 
+  select(-c(entry_date, entry_initial, collect_date, collect_initial, starts_with("a3"), sex)) %>%
+  left_join(tbl_PEG3_Demographic_case_cm %>% 
+              select(-pegid), by = "mailid") %>% 
+  mutate(
+    demo_entry_status = case_when(
+      !is.na(entry_initial) & !is.na(entry_date) ~ "Entry completed",
+      is.na(entry_initial) & !is.na(entry_date) ~ "Entry initial needed",
+      !is.na(entry_initial) & is.na(entry_date) ~ "Entry date needed",
+      is.na(entry_initial) & is.na(entry_date) 
+      & (!is.na(collect_initial) | !is.na(collect_date)) ~ "Entry needed",
+      is.na(entry_initial) & is.na(entry_date) 
+      & is.na(collect_initial) & is.na(collect_date) 
+      & !is.na(incidentid_index) & str_starts(pegid, "G") ~ "In CPDR",
+      TRUE ~ "pending"),
+    type = if_else(str_starts(pegid, "G"), "baseline", "prog")
+    ) 
+
+
+tbl_peg3_demo_entry_case <- list(tbl_peg3_demo_entry_nomailid_case, 
+                                 tbl_peg3_demo_entry_withmailid_case) %>% 
+  bind_rows()
+
+#### Demographic entry status for cases ####
+
+#### 1. baseline cases
+
+test <- tbl_peg3_demo_entry_case %>% 
+  filter(type == "baseline")
+
+tbl_peg3_demo_entry_case %>% 
+  filter(type == "baseline") %>% 
+  mutate(demo_entry_status = fct_relevel(demo_entry_status, 
+                                         c("Entry completed", "In CPDR", 
+                                           "In peg1/peg2/prog", "Entry needed", 
+                                           "Entry date needed", 
+                                           "Entry initial needed", 
+                                           "pending"))) %>% 
+  ggplot(aes(x = demo_entry_status, fill = demo_entry_status)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), 
+            position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c(
+    "Entry completed" = "#77BE96",
+    "In CPDR" = "#8BC496",
+    "In peg1/peg2/prog" = "#CADE9A",
+    # "Pending/Need to update RA checklist" = "#CEC289",
+    # "Cannot complete" = "#bbbbbb",
+    "Entry needed" = "#E9B3AD",
+    "Entry date needed" ="#D6B1CB",
+    "Entry initial needed" = "#ADBFD9",
+
+    "pending" = "#F2F2F2"
+  ))+
+  labs(title = str_c(Sys.Date(), " ", 
+                     "Demographic entry status for baseline PEG3 cases who have been contacted"),
+       x = "Entry status",
+       y = "Count") +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    plot.title = element_text(size = 12, hjust = 0.5)
+  )
+
+
+#### 2. prog cases
+
+test <- tbl_peg3_demo_entry_case %>% 
+  filter(type == "prog") %>% 
+  filter(demo_entry_status == "In peg1/peg2/prog")
+
+tbl_peg3_demo_entry_case %>% 
+  filter(type == "prog") %>% 
+  mutate(demo_entry_status = fct_relevel(demo_entry_status, 
+                                         c("Entry completed", "In CPDR", 
+                                           "In peg1/peg2/prog", "Entry needed", 
+                                           "Entry date needed", 
+                                           "Entry initial needed", 
+                                           "pending"))) %>% 
+  ggplot(aes(x = demo_entry_status, fill = demo_entry_status)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), 
+            position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c(
+    "Entry completed" = "#77BE96",
+    "In CPDR" = "#8BC496",
+    "In peg1/peg2/prog" = "#CADE9A",
+    # "Pending/Need to update RA checklist" = "#CEC289",
+    # "Cannot complete" = "#bbbbbb",
+    "Entry needed" = "#E9B3AD",
+    "Entry date needed" ="#D6B1CB",
+    "Entry initial needed" = "#ADBFD9",
+    
+    "pending" = "#F2F2F2"
+  ))+
+  labs(title = str_c(Sys.Date(), " ", 
+                     "Demographic entry status for prog cases in PEG3 database who have been contacted"),
+       x = "Entry status",
+       y = "Count") +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    plot.title = element_text(size = 12, hjust = 0.5)
+  )
+
+
+
+#### PEG3 wide forms missing check ####
+
+list(tbl_PEG3_checkra_case_cm, tbl_PEG3_checkra_hhctrl_cm, 
+     tbl_PEG3_checkra_popctrl_cm) %>% 
+  map(function(data){
+    data  %>%
+      mutate(ra_updrs_status = if_else(ra_pdmedno_status == "Completed" | 
+                                         ra_pdmedlastdose_status == "Completed", 
+                                       "Completed", NA),
+             form_completion = 
+               if_else(rowSums(across(starts_with("ra_"), ~!is.na(.))) > 0, 
+                       "Completed something", "Completed nothing")) %>% 
+      select(-c(ra_pdmedno_status, ra_pdmedlastdose_status))
+  }) %>% 
+  set_names("tbl_PEG3_checkra_clean_case_cm", "tbl_PEG3_checkra_clean_hhctrl_cm", 
+            "tbl_PEG3_checkra_clean_popctrl_cm") %>% 
+  list2env(.GlobalEnv)
+
+
+tbls_wide_todrop <- c("channel", "list_tbl", "finalSocial", "finalvaccine", 
+                  "medical_7w", "long", "occupation", "residence",
+                  "moca", "GDS", "bristol", "stress coping")
+
+tbl_list_case <- 
+  do.call("list", mget(grep("case_e1", names(.GlobalEnv), 
+                            value = T, ignore.case = TRUE) %>% 
+                         discard(~str_detect(.x, 
+                                             paste(tbls_wide_todrop, 
+                                                   collapse = "|(?i)"))))) %>% 
+  .[order(names(.))]
+
+tbl_list_hhctrl <- 
+  do.call("list", mget(grep("hhctrl_e1", names(.GlobalEnv), 
+                            value = T, ignore.case = TRUE) %>% 
+                         discard(~str_detect(.x, 
+                                             paste(c(tbls_wide_todrop,
+                                                     "rating scale", 
+                                                     "medical 6"),
+                                                   collapse = "|(?i)"))))) %>% 
+  .[order(names(.))]
+
+tbl_list_popctrl <- 
+  do.call("list", mget(grep("popctrl_e1", names(.GlobalEnv), 
+                            value = T, ignore.case = TRUE) %>% 
+                         discard(~str_detect(.x, 
+                                             paste(c(tbls_wide_todrop,
+                                                     "rating scale", 
+                                                     "medical 6"), 
+                                                   collapse = "|(?i)"))))) %>% 
+  .[order(names(.))]
+
+
+# tbl_PEG3_checkra_case_cm %<>% 
+#   left_join(tbl_PEG3_PatientDetail_case_cm %>% 
+#               select(pegid, phys_apptdate_status), by = "pegid") %>% 
+#   rename(ra_updrs_status = phys_apptdate_status)
+
+
+tbl_names_wide_case <- list("antibiotics", "constipation", "qualityoflife", 
+                            "main_followup", "main interview", 
+                            "medicalchecklist", "pdmedication", 
+                            "updrs", "patientquestion")
+
+tbl_names_wide_hhctrl <- list("antibiotics", "caregiver_burden", "constipation", 
+                              "qualityoflife", "main_followup", 
+                              "main interview", "medicalchecklist", 
+                              "patientquestion")
+
+tbl_names_wide_popctrl <- list("antibiotics", "constipation", "qualityoflife", 
+                               "main_followup", "main interview", 
+                               "medicalchecklist", "patientquestion")
+
+var_names_wide_case <- list("antibiotics", "constipation", "qualityoflife", 
+                    "mainlife", "mainlife", "medicalcheck", "pdmedcheck", 
+                    "updrs", "patientquestion")
+
+var_names_wide_hhctrl <- list("antibiotics", "zarit", "constipation", 
+                              "qualityoflife", "mainlife", "mainlife", 
+                              "medicalcheck", "patientquestion")
+
+var_names_wide_popctrl <- list("antibiotics", "constipation", "qualityoflife", 
+                         "mainlife", "mainlife", "medicalcheck", 
+                         "patientquestion")
+
+tbl_list_wide_clean <- list(
+  list(tbl_list_case, tbl_list_hhctrl, tbl_list_popctrl),
+  list(tbl_PEG3_checkra_clean_case_cm, tbl_PEG3_checkra_clean_hhctrl_cm, 
+       tbl_PEG3_checkra_clean_popctrl_cm),
+  list(var_names_wide_case, var_names_wide_hhctrl, var_names_wide_popctrl)
+) %>% 
+  pmap(function(data1, data2, data3){
+    list(data1, data3) %>% 
+      pmap(function(df1, df2){
+        df1 %>% 
+          left_join(data2 %>% 
+                      select(pegid, ra_consent, 
+                             matches(df2)), by = "pegid") %>% 
+          rename_with(~replace(.x, str_detect(.x, "_status"), 
+                               "ra_status"), 
+                      contains("_status"))
+      })
+  })
+
+tbl_list_wide_clean_needfoldercheck <- list(tbl_list_wide_clean, 
+     list(tbl_names_wide_case, tbl_names_wide_hhctrl, 
+          tbl_names_wide_popctrl)) %>% 
+  pmap(function(datalist, tbl_name){
+    list(datalist, tbl_name) %>% 
+      pmap(function(df1, df2){
+        df1 %>% 
+          filter(is.na(entry_initial)&!is.na(ra_status) |
+                   (!is.na(entry_initial)&is.na(ra_status))) %>% 
+          select(pegid, entry_initial, ra_status) %>% 
+          mutate(form = df2)
+      })
+  })
+
+
+tbl_list_wide_clean_needfoldercheck_new <- 
+  tbl_list_wide_clean_needfoldercheck %>% 
+  map(function(datalist){
+    datalist %>% 
+      bind_rows() %>% 
+      pivot_wider(
+        id_cols = pegid,
+        names_from = form,
+        values_from = c(entry_initial, ra_status)
+      ) %>% 
+      select(pegid, order(str_extract(names(.), "[^_]+$")))
+  })
+
+list(tbl_list_wide_clean_needfoldercheck_new, 
+     c("tbl_towrite_checkfolder_case", "tbl_towrite_checkfolder_hhctrl",
+       "tbl_towrite_checkfolder_popctrl")) %>% 
+  pmap(function(data1, data2){
+    write_csv(data1, file = paste(data2, "csv", sep = "."), na = "")
+  })
+
+
+# test <- tbl_list_case[[1]] %>% 
+#   left_join(tbl_PEG3_checkra_case_cm %>% 
+#               select(pegid, ra_consent, 
+#                      matches("antibiotics")), by = "pegid") %>% 
+#   rename_with(~replace(.x, str_detect(.x, "_status"), 
+#                        "ra_status"), 
+#               contains("_status"))
+
+tbl_wide_need_entry_all <- list(
+  tbl_list_wide_clean,
+  list(tbl_names_wide_case, tbl_names_wide_hhctrl, tbl_names_wide_popctrl)
+) %>% 
+  pmap(function(data1, data2){
+    list(data1, data2) %>% 
+      pmap(function(df1, df2){
+        df1 %>% 
+          mutate(
+            entry_status = 
+              case_when(
+                !is.na(entry_initial) & !is.na(entry_date) ~ "Entry completed",
+                is.na(entry_initial) 
+                & !is.na(entry_date) ~ "Entry initial needed",
+                is.na(entry_initial) & is.na(entry_date) 
+                & (ra_status == 1 | 
+                     ra_status %in% c("Completed"))~ "Entry needed",
+                !is.na(entry_initial) & is.na(entry_date) ~ "Entry date needed",
+                is.na(entry_initial) & (ra_status == 0 | 
+                  ra_status %notin% c("Completed")) ~ "Pending/Need to update RA checklist",
+                ra_consent == 0| ra_status %notin% c("Completed") ~ "Haven't been consented"
+                ), 
+            form = df2) %>% 
+          mutate_at(vars(ends_with("date")), ~if_else(str_detect(.x, "/"), 
+                                                      mdy(.x), ymd(.x))) %>% 
+          select(pegid, entry_initial, entry_date, 
+                 entry_status, ra_status, form) 
+      })
+  }) 
+
+
+list(
+  tbl_wide_need_entry_all,
+  list("case", "hhctrl", "popctrl"),
+  list(tbl_names_wide_case, tbl_names_wide_hhctrl, 
+       tbl_names_wide_popctrl)
+) %>% 
+  pmap(function(data1, data2, data3){
+    data1 %>% 
+      set_names(glue("tbl_{data2}_{data3}_need_entry")) %>% 
+      list2env(.,envir = .GlobalEnv)
+  })
+
+#### PEG3 long forms missing check ####
+
+
+do.call("list", mget(
+  grep("long|occupation|residence|bristol", names(.GlobalEnv), 
+       value = T, ignore.case = TRUE))) %>% 
+  .[order(names(.))] %>% 
+  map(function(data){
+    data %>% 
+      arrange(pegid, entry_initial) %>%
+      group_by(pegid) %>% 
+      slice(1) %>% 
+      ungroup()
+  }) %>% 
+  set_names(paste(names(.), "first", sep = "_")) %>% 
+  list2env(.GlobalEnv)
+
+
+tbl_list_first_case <- do.call("list", 
+                                 mget(
+                                   grep("case_e1_first", names(.GlobalEnv), 
+                                        value = T, ignore.case = TRUE))) %>% 
+  .[order(names(.))]
+
+tbl_list_first_hhctrl <- do.call("list", 
+                                 mget(
+                                   grep("hhctrl_e1_first", names(.GlobalEnv),
+                                        value = T, ignore.case = TRUE))) %>% 
+  .[order(names(.))]
+
+tbl_list_first_popctrl <- do.call("list", 
+                                 mget(
+                                   grep("popctrl_e1_first", names(.GlobalEnv), 
+                                        value = T, ignore.case = TRUE))) %>% 
+  .[order(names(.))]
+
+
+tbl_names_long <- list("bristol", "moca", "occupation", "gds", "residence")
+var_names_long <- list("bristol", "moca", "timeline", "gds", "timeline")
+
+
+tbl_list_long_clean <- list(
+  list(tbl_list_first_case, tbl_list_first_hhctrl, tbl_list_first_popctrl),
+  list(tbl_PEG3_checkra_case_cm, tbl_PEG3_checkra_hhctrl_cm, 
+       tbl_PEG3_checkra_popctrl_cm)
+) %>% 
+  pmap(function(data1, data2){
+    list(data1, var_names_long) %>% 
+      pmap(function(df1, df2){
+        df1 %>% 
+          left_join(data2 %>% 
+                      select(pegid, ra_consent, 
+                             matches(df2)), by = "pegid") %>% 
+          rename_with(~replace(.x, str_detect(.x, "_status"), 
+                               "ra_status"), 
+                      contains("_status"))
+      })
+  })
+
+
+tbl_list_long_clean_needfoldercheck <- list(tbl_list_long_clean, 
+                                            list(tbl_names_long, tbl_names_long, 
+                                                 tbl_names_long)) %>% 
+  pmap(function(datalist, tbl_name){
+    list(datalist, tbl_name) %>% 
+      pmap(function(df1, df2){
+        df1 %>% 
+          filter(is.na(entry_initial)&!is.na(ra_status) |
+                   (!is.na(entry_initial)&is.na(ra_status))) %>% 
+          select(pegid, entry_initial, ra_status) %>% 
+          mutate(form = df2)
+      })
+  })
+
+
+tbl_list_long_clean_needfoldercheck_new <- 
+  tbl_list_long_clean_needfoldercheck %>% 
+  map(function(datalist){
+    datalist %>% 
+      bind_rows() %>% 
+      pivot_wider(
+        id_cols = pegid,
+        names_from = form,
+        values_from = c(entry_initial, ra_status)
+      ) %>% 
+      select(pegid, order(str_extract(names(.), "[^_]+$")))
+  })
+
+
+list(tbl_list_long_clean_needfoldercheck_new, 
+     c("tbl_towrite_long_checkfolder_case", "tbl_towrite_long_checkfolder_hhctrl",
+       "tbl_towrite_long_checkfolder_popctrl")) %>% 
+  pmap(function(data1, data2){
+    write_csv(data1, file = paste(data2, "csv", sep = "."), na = "")
+  })
+
+tbl_long_need_entry_all <- tbl_list_long_clean %>% 
+  map(function(data){
+    list(data, tbl_names_long) %>% 
+      pmap(function(df1, df2){
+        df1 %>% 
+          mutate(
+            entry_status = 
+              case_when(
+                !is.na(entry_initial) & !is.na(entry_date) ~ "Entry completed",
+                is.na(entry_initial) 
+                & !is.na(entry_date) ~ "Entry initial needed",
+                is.na(entry_initial) & is.na(entry_date) 
+                & (ra_status == 1 | 
+                     ra_status %in% c("Completed"))~ "Entry needed",
+                !is.na(entry_initial) & is.na(entry_date) ~ "Entry date needed",
+                is.na(entry_initial) & (ra_status == 0 | 
+                  ra_status %notin% c("Completed")) ~ "Pending/Need to update RA checklist",
+                ra_consent == 0 | ra_status %notin% c("Completed") ~ "Haven't been consented"
+                ), 
+            form = df2) %>% 
+          mutate_at(vars(ends_with("date")), ~if_else(str_detect(.x, "/"), 
+                                                      mdy(.x), ymd(.x))) %>% 
+          select(pegid, entry_initial, entry_date, 
+                 entry_status, ra_status, form) 
+      })
+  }) 
+
+list(
+  tbl_long_need_entry_all,
+  list("case", "hhctrl", "popctrl")
+) %>% 
+  pmap(function(data1, data2){
+    data1 %>% 
+      set_names(glue("tbl_{data2}_{tbl_names_long}_need_entry")) %>% 
+      list2env(.,envir = .GlobalEnv)
+  })
+
+
+forms_todrop_case <- c("constipation", "sle")
+forms_todrop_ctrl <- c("updrs", "pdmedication", "constipation", "sle")
+
+list(tbl_wide_need_entry_all, tbl_long_need_entry_all, 
+     list(forms_todrop_case, forms_todrop_ctrl, forms_todrop_ctrl)) %>% 
+  pmap(function(data1, data2, data3){
+    c(data1, data2) %>% 
+      bind_rows() %>% 
+      filter(form %notin% data3)
+  }) %>% 
+  set_names("tbl_peg3_case_tracking", "tbl_peg3_hhctrl_tracking",
+            "tbl_peg3_popctrl_tracking") %>% 
+  list2env(.,envir = .GlobalEnv)
+
+
+list(tbl_peg3_case_tracking, tbl_peg3_hhctrl_tracking, 
+     tbl_peg3_popctrl_tracking) %>% 
+  map(~pivot_wider(
+    data = .x,
+    id_cols = pegid,
+    names_from = form,
+    values_from = entry_status) %>% 
+      mutate(timeline = case_when(
+        occupation == "Entry completed" & residence == "Entry completed" ~ "Entry completed", 
+        occupation != "Entry completed" & residence == "Entry completed" ~ "Partially completed",
+        occupation == "Entry completed" & residence != "Entry completed" ~ "Partially completed",
+        occupation == "Pending/Need to update RA checklist" | residence != "Pending/Need to update RA checklist" ~ "Pending/Need to update RA checklist",
+        TRUE ~ NA
+      ),
+      lifehistory = case_when(
+        `main interview` == "Entry completed" | main_followup == "Entry completed" ~ "Entry completed",
+        `main interview` == "Entry needed" | main_followup == "Entry needed" ~ "Entry needed",
+        `main interview` == "Entry initial needed" | main_followup == "Entry initial needed" ~ "Entry initial needed",
+        `main interview` == "Pending/Need to update RA checklist" | main_followup == "Pending/Need to update RA checklist" ~ "Pending/Need to update RA checklist",
+        TRUE ~ NA
+      )) %>% 
+      select(-c(occupation, residence, `main interview`, main_followup))
+    ) %>% 
+  set_names("tbl_peg3_case_tracking_wide", "tbl_peg3_hhctrl_tracking_wide", 
+            "tbl_peg3_popctrl_tracking_wide") %>% 
+  list2env(.,envir = .GlobalEnv)
+
+
+tbl_towrite <- list(tbl_peg3_case_tracking = tbl_peg3_case_tracking, 
+                    tbl_peg3_hhctrl_tracking = tbl_peg3_hhctrl_tracking, 
+                    tbl_peg3_popctrl_tracking = tbl_peg3_popctrl_tracking)
+
+list(tbl_towrite, names(tbl_towrite)) %>% 
+  pmap(function(data1, data2){
+    write_csv(data1, file = paste(data2, "csv", sep = "."), na = "")
+  })
+
+
+#create appt status variable for controls with all NAs
+list(tbl_PEG3_HHctrlDetail_hhctrl_cm, tbl_PEG3_PopctrlDetail_popctrl_cm) %>% 
+  map(function(data){
+    data %>% 
+      mutate(phys_apptdate_status = NA) %>% 
+      mutate(phys_apptdate_status = as.character(phys_apptdate_status))
+  }) %>% 
+  set_names("tbl_PEG3_HHctrlDetail_hhctrl_cm", 
+            "tbl_PEG3_PopctrlDetail_popctrl_cm") %>% 
+  list2env(.GlobalEnv)
+
+
+#list all active enrolled participants with stool samples
+
+
+pegid_ineligible <- list(tbl_PEG3_Screening_case_cm, tblScreening_hhctrl_cm, 
+     tbl_popH_recruitment_combined_popctrl_cm) %>% 
+  map(function(data){
+    data %>% 
+      filter(screeningstatus %notin% c(15, 9)) %>% # participants who are not eligible/already in peg
+      select(pegid, screeningstatus) %>% 
+      distinct()
+  }) %>% 
+  bind_rows()
+
+list(tbl_PEG3_Screening_clean_hhctrl_cm,
+     tbl_PEG3_Screening_clean_filtered_popctrl_cm) %>% 
+  map(function(data){
+    data %>% 
+      mutate(incidentid_index = NA_character_)
+  }) %>% 
+  set_names("tbl_PEG3_Screening_clean_hhctrl_cm",
+            "tbl_PEG3_Screening_clean_filtered_popctrl_cm") %>%
+  list2env(.GlobalEnv)
+
+list(
+  list(tbl_PEG3_PatientDetail_case_cm, tbl_PEG3_HHctrlDetail_hhctrl_cm,
+       tbl_PEG3_PopctrlDetail_popctrl_cm),
+  list(tbl_PEG3_Screening_clean_filtered_case_cm, tbl_PEG3_Screening_clean_hhctrl_cm,
+       tbl_PEG3_Screening_clean_filtered_popctrl_cm),
+  list(tbl_peg3_fecal_case, tbl_peg3_fecal_hhctrl, 
+       tbl_peg3_fecal_popctrl),
+  list(tbl_PEG3_visit2_case_cm, tbl_PEG3_visit2_hhctrl_cm, 
+       tbl_PEG3_visit2_popctrl_cm)
+) %>%
+  pmap(function(data1, data2, data3, data4){
+    data1 %>%
+      select(-matches(c("screeningstatus", "mailid"))) %>%
+      full_join(data2 %>% 
+                  select(matches(c("pegid", "mailid", "screeningstatus", 
+                                   "incidentid_index"))), by = "pegid") %>% 
+      relocate(pegid, mailid) %>% 
+      # filter(!is.na(screeningstatus) |
+      #          !is.na(enroll_date) |
+      #          !is.na(peg3status1)) %>%
+      full_join(data3, by = "pegid") %>% 
+      left_join(data4, by = "pegid") %>%
+      filter(!(is.na(pegid) & is.na(mailid))) %>% 
+      # filter(pegid  %notin% pegid_ineligible$pegid) %>%
+      filter(!is.na(screeningstatus) 
+             | bloodstatus == 1 
+             | bloodstatus_v2 == 1 
+             | !is.na(collect_date)
+             | !is.na(phys_apptdate_status)) %>% # has blood draw or phys appt
+      # filter(!is.na(bloodstatus) | !is.na(phys_apptdate_status)) %>%
+      # filter(!is.na(enroll_date)) %>% # has enroll date 
+      mutate_at(vars(ends_with("date")), ~if_else(str_detect(.x, "/"), 
+                                                 mdy(.x), ymd(.x))) %>% 
+      group_by(pegid, mailid, incidentid_index) %>%
+      slice(1) %>%
+      ungroup() 
+  }) %>% 
+  set_names("tbl_PEG3_active_sample_case", "tbl_PEG3_active_sample_hhctrl",
+            "tbl_PEG3_active_sample_popctrl") %>% 
+  list2env(.GlobalEnv)
+
+list(
+  list(tbl_PEG3_PatientDetail_case_cm, tbl_PEG3_HHctrlDetail_hhctrl_cm,
+       tbl_PEG3_PopctrlDetail_popctrl_cm),
+  list(tbl_PEG3_Screening_clean_filtered_case_cm, tbl_PEG3_Screening_clean_hhctrl_cm,
+       tbl_PEG3_Screening_clean_filtered_popctrl_cm),
+  list(tbl_peg3_fecal_case, tbl_peg3_fecal_hhctrl, 
+       tbl_peg3_fecal_popctrl),
+  list(tbl_PEG3_visit2_case_cm, tbl_PEG3_visit2_hhctrl_cm, 
+       tbl_PEG3_visit2_popctrl_cm)
+) %>%
+  pmap(function(data1, data2, data3, data4){
+    data1 %>%
+      select(-matches(c("screeningstatus", "mailid"))) %>%
+      full_join(data2 %>% 
+                  select(matches(c("pegid", "mailid", "screeningstatus", 
+                                   "incidentid_index"))), by = "pegid") %>% 
+      relocate(pegid, mailid) %>% 
+      # filter(!is.na(screeningstatus) |
+      #          !is.na(enroll_date) |
+      #          !is.na(peg3status1)) %>%
+      full_join(data3, by = "pegid") %>% 
+      left_join(data4, by = "pegid") %>%
+      filter(!(is.na(pegid) & is.na(mailid))) %>% 
+      # filter(pegid  %notin% pegid_ineligible$pegid) %>%
+      filter(!is.na(screeningstatus) 
+             # | bloodstatus == 1 
+             # | bloodstatus_v2 == 1 
+             # | !is.na(collect_date)
+             | !is.na(phys_apptdate_status)) %>% # has blood draw or phys appt
+      # filter(!is.na(bloodstatus) | !is.na(phys_apptdate_status)) %>%
+      # filter(!is.na(enroll_date)) %>% # has enroll date 
+      mutate_at(vars(ends_with("date")), ~if_else(str_detect(.x, "/"), 
+                                                  mdy(.x), ymd(.x))) %>% 
+      group_by(pegid, mailid, incidentid_index) %>%
+      slice(1) %>%
+      ungroup() 
+  }) %>% 
+  set_names("tbl_PEG3_active_nosample_case", "tbl_PEG3_active_nosample_hhctrl",
+            "tbl_PEG3_active_nosample_popctrl") %>% 
+  list2env(.GlobalEnv)
+
+list(
+  list(tbl_PEG3_PatientDetail_case_cm, tbl_PEG3_HHctrlDetail_hhctrl_cm,
+       tbl_PEG3_PopctrlDetail_popctrl_cm),
+  list(tbl_PEG3_Screening_clean_filtered_case_cm, tbl_PEG3_Screening_clean_hhctrl_cm,
+       tbl_PEG3_Screening_clean_filtered_popctrl_cm),
+  list(tbl_peg3_fecal_case, tbl_peg3_fecal_hhctrl, 
+       tbl_peg3_fecal_popctrl)
+) %>%
+  pmap(function(data1, data2, data3){
+    data1 %>%
+      select(-matches("screeningstatus")) %>%
+      full_join(data2 %>% 
+                  select(matches(c("pegid", "screeningstatus", 
+                                   "incidentid_index"))), by = "pegid") %>% 
+      filter(!is.na(screeningstatus) |
+               !is.na(enroll_date) |
+               !is.na(peg3status1)) %>%
+      full_join(data3, by = "pegid") %>% 
+      filter(!(is.na(pegid) & is.na(mailid))) %>% 
+      # filter(pegid  %notin% pegid_ineligible$pegid) %>%
+      filter((is.na(bloodstatus) | bloodstatus != 1) & pegid %notin% data3$pegid) %>% # doesn't have blood draw or stool
+      filter(str_length(pegid) > 6) %>% 
+      # filter(!is.na(bloodstatus) | !is.na(phys_apptdate_status)) %>%
+      # filter(!is.na(enroll_date)) %>% # has enroll date 
+      mutate_at(vars(ends_with("date")), ~if_else(str_detect(.x, "/"), 
+                                                  mdy(.x), ymd(.x))) %>% 
+      group_by(pegid) %>%
+      slice(1) %>%
+      ungroup() 
+  }) %>% 
+  set_names("tbl_PEG3_active_nosample_case", "tbl_PEG3_active_nosample_hhctrl",
+            "tbl_PEG3_active_nosample_popctrl") %>% 
+  list2env(.GlobalEnv)
+
+
+list(
+  list(tbl_PEG3_PatientDetail_case_cm, tbl_PEG3_HHctrlDetail_hhctrl_cm,
+       tbl_PEG3_PopctrlDetail_popctrl_cm),
+  list(tbl_PEG3_Screening_clean_filtered_case_cm, tbl_PEG3_Screening_clean_hhctrl_cm,
+       tbl_PEG3_Screening_clean_filtered_popctrl_cm),
+  list(tbl_peg3_fecal_case, tbl_peg3_fecal_hhctrl, 
+       tbl_peg3_fecal_popctrl)
+) %>%
+  pmap(function(data1, data2, data3){
+    data1 %>%
+      select(-matches("screeningstatus")) %>%
+      full_join(data2 %>% 
+                  select(matches(c("pegid", "screeningstatus", 
+                                   "incidentid_index"))), by = "pegid") %>% 
+      filter(!is.na(screeningstatus) |
+               !is.na(enroll_date) |
+               !is.na(peg3status1)) %>%
+      full_join(data3, by = "pegid") %>% 
+      filter(!(is.na(pegid) & is.na(mailid))) %>% 
+      # filter(pegid  %notin% pegid_ineligible$pegid) %>%
+      filter((is.na(bloodstatus) | bloodstatus != 1) & pegid %notin% data3$pegid) %>% # has blood draw or stool
+      filter(str_length(pegid) <= 6 | is.na(pegid)) %>%
+      # filter(!is.na(bloodstatus) | !is.na(phys_apptdate_status)) %>%
+      # filter(!is.na(enroll_date)) %>% # has enroll date 
+      mutate_at(vars(ends_with("date")), ~if_else(str_detect(.x, "/"), 
+                                                  mdy(.x), ymd(.x)))
+  }) %>% 
+  set_names("tbl_PEG3_nonactive_case", "tbl_PEG3_nonactive_hhctrl",
+            "tbl_PEG3_nonactive_popctrl") %>% 
+  list2env(.GlobalEnv)
+
+
+
+## cases ##
+# anyone with screening/ 
+# with stool/ blood/ neuro/ 
+# priority forms: moca, gds, updrs 
+# secondary forms: medicalchecklist, timeline, main interview, 
+# diet, stool forms (antibiotics, bristol), any forms with key variables
+# all else
+
+## hhctrl ##
+# include anyone
+
+
+## pop controls ##
+# anyone did stool/blood/consent
+# same as above without neuro forms
+
+list(
+  list(tbl_PEG3_active_sample_case, tbl_PEG3_active_sample_hhctrl,
+       tbl_PEG3_active_sample_popctrl),
+  list(tbl_peg3_case_tracking_wide, tbl_peg3_hhctrl_tracking_wide, 
+       tbl_peg3_popctrl_tracking_wide), 
+  list(tbl_PEG3_PatientDetail_case_cm, tbl_PEG3_HHctrlDetail_hhctrl_cm,
+       tbl_PEG3_PopctrlDetail_popctrl_cm),
+  list(tbl_PEG3_checkra_clean_case_cm, tbl_PEG3_checkra_clean_hhctrl_cm,
+       tbl_PEG3_checkra_clean_popctrl_cm),
+  list(tbl_peg3_fecal_case, tbl_peg3_fecal_hhctrl, 
+       tbl_peg3_fecal_popctrl)
+) %>% 
+  pmap(function(data1, data2, data3, data4, data5){
+    data1 %>% 
+      left_join(data2, by = "pegid") %>% 
+      select(matches(c("pegid", "mailid", "moca", "gds", "updrs", 
+                       "medicalchecklist", "timeline", "lifehistory", 
+                       "screen", "incidentid_index"))) %>%
+      distinct() %>% 
+      left_join(data3 %>% 
+                  select(-matches("screeningstatus", "mailid")), 
+                by = c("pegid", "mailid")) %>% 
+      left_join(data4 %>% 
+                  select(pegid, ra_blood, ra_stool, form_completion), 
+                by = "pegid") %>%
+      left_join(data5, by = "pegid") %>%
+      mutate_at(vars(ends_with("date")), ~if_else(str_detect(.x, "/"), 
+                                                  mdy(.x), ymd(.x))) %>% 
+      mutate_at(vars(moca:lifehistory), 
+                ~replace(., 
+                         . %in% c("Pending/Need to update RA checklist"), 
+                         NA)) %>%
+      # mutate(form_completion_new = case_when(
+      #   rowSums(across(moca:lifehistory, ~!is.na(.))) > 0 | 
+      #     bloodstatus %in% c(1, 3, 7) | 
+      #     stoolstatus %in% c(1, 3, 7) | 
+      #     phys_apptdate_status == "1" ~ "Completed something",
+      #   TRUE ~ "Completed nothing"
+      # )) %>%
+      select(-form_completion) %>% 
+      arrange(screeningstatus) %>% 
+      group_by(pegid, mailid, incidentid_index) %>%
+      slice(1) %>%
+      ungroup() %>% 
+      # replace_na(list(form_completion = "Completed nothing")) %>% 
+      set_value_labels(
+        screeningstatus = c(
+          "Unable to contact" = 0,
+          "No PD" = 1, 
+          "Dx<=2015" = 2, 
+          "Not lived in Fresno, Kern or Tulare" = 3,
+          "lived in California < 5 years" = 4,
+          "Deceased" = 5,
+          "Cognitive condition" = 6,
+          "Too ill" = 7,
+          "Institutionalized" = 8,
+          "Already in PEG" = 9,
+          "Proxy Refusal -- Eligible" = 10,
+          "Refused -- Eligible" = 11,
+          "Proxy Refusal -- Unknown Eligibility" = 12,
+          "Refused -- Unknown Eligibility" = 13,
+          "Unable to communicate" = 14,
+          "Eligible" = 15
+        ),
+        peg3status1 = c(
+          "Deceased" = 1,
+          "Too ill" = 2,
+          "No PD" = 3,
+          "Withdrew / can use information" = 4,
+          "Withdrew / destroy information" = 5,
+          "Unable to recontact" = 6,
+          "Refused" = 7,
+          "Proxy refusal" = 8,
+          "Other, please specify:" = 9,
+          "Do not contact" = 10,
+          "Do not contact" = 11
+        ),
+        bloodstatus = c(
+          "Clinic - Successful" = 1,
+          "Clinic - Not Successful" = 2,
+          "Home Visit - Requested and Successful" = 3,
+          "Home Visit - Requested and Not Successful" = 4,
+          "Cannot Participate - Too ill to leave home" = 5,
+          "Refused Sample" = 6,
+          "By-mail Collection - Successful" = 7,
+          "By-mail Collection - Not Successful" = 8,
+          "NA - Not in FKT counties" = 9,
+          "Ineligible" = 10
+        ),
+        stoolstatus = c(
+          "Clinic - Successful" = 1,
+          "Clinic - Not Successful" = 2,
+          "Home Visit - Requested and Successful" = 3,
+          "Home Visit - Requested and Not Successful" = 4,
+          "Cannot Participate - Too ill to leave home" = 5,
+          "Refused Sample" = 6,
+          "By-mail Collection - Successful" = 7,
+          "By-mail Collection - Not Successful" = 8,
+          "NA - Not in FKT counties" = 9,
+          "Ineligible" = 10
+        ),
+        phys_apptdate_status = c(
+          "No" = "0",
+          "Yes" = "1",
+          "Need to be re-examined" = "2"
+        )
+      ) %>% 
+      modify_if(is.labelled, to_character) %>% 
+      relocate(pegid, mailid, consent_date, enroll_date) %>% 
+      mutate(inpeg3 = if_else(pegid %notin% data3$pegid 
+                              & !str_starts(pegid, "G"), "Not in PEG3", "In PEG3"),
+             collect = if_else(collect_date >= "2020-01-01", 
+                               "Collected after 2020", 
+                               "Collected before 2020"))
+  }) %>% 
+  set_names("df_case", "df_hhctrl", "df_popctrl") %>%
+  list2env(.GlobalEnv)
+
+# df_case_new <- df_case %>% 
+#   filter(!(form_completion_new != "Completed something" 
+#          & !is.na(incidentid_index) & !str_starts(pegid, "G|8")))
+
+list(df_hhctrl, df_popctrl) %>% 
+  map(function(data){
+    data %>% 
+      mutate(incidentid_index = NA_character_) %>% 
+      mutate_at(vars(screeningstatus), ~replace(., . %in% c("No PD"), "Has PD")) %>% 
+      mutate_at(vars(screeningstatus), ~replace(., . %in% c("Dx<=2015"), "Less than 35-yr-old")) 
+  }) %>% 
+  set_names("df_hhctrl", "df_popctrl") %>% 
+  list2env(.GlobalEnv)
+
+
+list(
+  list(df_case, df_hhctrl, df_popctrl),
+  list(tbl_PEG3_Demographic_case_cm, tbl_PEG3_Demographic_hhctrl_cm, 
+       tbl_PEG3_Demographic_popctrl_cm)
+) %>% 
+  pmap(function(data1, data2){
+    data1 %>% 
+      full_join(data2 %>% 
+                  rename(collect_date_demo = collect_date,
+                         mailid_demo = mailid,
+                         sex_demo = sex), by = "pegid") %>% 
+      group_by(pegid, mailid, incidentid_index) %>%
+      slice(1) %>%
+      ungroup() %>% 
+      # mutate(demo_entry_status = case_when(
+      #   !is.na(entry_initial) & !is.na(entry_date) ~ "Entry completed",
+      #   is.na(entry_initial) & !is.na(entry_date) ~ "Entry initial needed",
+      #   !is.na(entry_initial) & is.na(entry_date) ~ "Entry date needed",
+      #   is.na(entry_initial) & is.na(entry_date) 
+      #   & (!is.na(collect_initial) | !is.na(collect_date)) ~ "Entry needed",
+      #   is.na(entry_initial) & is.na(entry_date) 
+      #   & is.na(collect_initial) & is.na(collect_date) 
+      #   & !is.na(incidentid_index) & screeningstatus == 9 ~ "In peg1/peg2/prog",
+      #   is.na(entry_initial) & is.na(entry_date) 
+      #   & is.na(collect_initial) & is.na(collect_date) 
+      #   & !is.na(incidentid_index) & screeningstatus != 9 ~ "In CPDR",
+      #   TRUE ~ "pending"
+      # )) 
+      # mutate_at(vars(moca:lifehistory), 
+      #           ~case_when(
+      #             is.na(.) & !is.na(peg3status1) ~ "Cannot complete",
+      #             is.na(.) & is.na(peg3status1) & is.na(mailid_demo) & inpeg3 == "Not in PEG3" ~ "Entered in Prog database",
+      #             TRUE ~ .
+      #           )) %>% 
+      mutate(
+        demo_entry_status = case_when(
+          !is.na(entry_initial) & !is.na(entry_date) ~ "Entry completed",
+          str_starts(pegid, "G6|G7|G8") & !is.na(sex) ~ "Entry completed",
+          is.na(entry_initial) & !is.na(entry_date) ~ "Entry initial needed",
+          !is.na(entry_initial) & is.na(entry_date) ~ "Entry date needed",
+          is.na(entry_initial) & is.na(entry_date)
+          & (!is.na(collect_initial) | !is.na(collect_date_demo)) ~ "Entry needed",
+          is.na(entry_initial) & is.na(entry_date)
+          & is.na(collect_initial) & is.na(collect_date_demo)
+          & !str_starts(pegid, "G") ~ "In old database",
+          is.na(entry_initial) & is.na(entry_date)
+          & is.na(collect_initial) & is.na(collect_date_demo)
+          & !is.na(incidentid_index) & str_starts(pegid, "G") 
+          & screeningstatus %in% c("Eligible") ~ "pending",
+          is.na(entry_initial) & is.na(entry_date)
+          & is.na(collect_initial) & is.na(collect_date_demo)
+          & !is.na(incidentid_index) & is.na(pegid) 
+          & str_starts(mailid, "G")
+          & screeningstatus %in% c("Deceased", "Institutionalized", "Too ill") ~ "Cannot collect",
+          TRUE ~ "pending"),
+        type = case_when(
+          !str_starts(pegid, "G") & str_starts(mailid, "G") ~ "prog",
+          str_starts(pegid, "G") | str_starts(mailid, "G") ~ "baseline",
+          !str_starts(pegid, "G") ~ "prog",
+          TRUE ~ "pending")
+        ) %>% 
+      filter(
+        !(pegid %in% c("G10010EK48", "G10019DM43", 
+                       "G10013RC54", "G10007JH46") 
+          & screeningstatus == "Already in PEG"))
+  }) %>% 
+  set_names("df_case_demo", "df_hhctrl_demo", 
+            "df_popctrl_demo") %>% 
+  list2env(.GlobalEnv)
+
+
+
+#### Demographic entry status ####
+
+test <- df_case_demo %>% 
+  select(pegid, mailid, screeningstatus, type, demo_entry_status) %>% 
+  filter(demo_entry_status == "pending")
+
+
+list(
+  list(df_case_demo, df_hhctrl_demo, df_popctrl_demo),
+  list("cases", "hhctrls", "popctrls")
+) %>% 
+  pmap(function(data, x){
+    data %>% 
+      # filter(type == "prog") %>% 
+      mutate(demo_entry_status = fct_relevel(demo_entry_status, 
+                                             c("Entry completed", "In CPDR", 
+                                               "In old database", "Entry needed", 
+                                               "Entry date needed", 
+                                               "Entry initial needed", 
+                                               "Cannot collect",
+                                               "pending"))) %>% 
+      group_by(type) %>% 
+      ggplot(aes(x = demo_entry_status, fill = demo_entry_status)) +
+      geom_bar() +
+      geom_text(stat = "count", aes(label = after_stat(count)), 
+                position = position_stack(vjust = 0.5)) +
+      scale_fill_manual(values = c(
+        "Entry completed" = "#77BE96",
+        "In CPDR" = "#8BC496",
+        "In old database" = "#CADE9A",
+        # "Pending/Need to update RA checklist" = "#CEC289",
+        # "Cannot complete" = "#bbbbbb",
+        "Entry needed" = "#E9B3AD",
+        "Entry date needed" ="#D6B1CB",
+        "Entry initial needed" = "#ADBFD9",
+        "Cannot collect" = "grey",
+        "pending" = "#F2F2F2"
+      ))+
+      facet_wrap(~type, scales = "free") +
+      labs(title = str_c(Sys.Date(), " ", 
+                         glue("Demographic entry status for anyone with screening status / samples in {x}")),
+           x = "Entry status",
+           y = "Count") +
+      theme_classic() +
+      theme(
+        legend.position = "none",
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 12, hjust = 0.5)
+      )
+  }) %>% 
+  set_names("Cases", "Household Controls", "Population Controls")
+
+#### Form entry status ####
+
+# merge the entry status for forms from old database
+list(
+  list(df_case_demo, df_hhctrl_demo, df_popctrl_demo),
+  list(tbl_peg2_form_completion, tbl_oldhhctrl_form_completion, 
+       tbl_cgep_form_completion)
+) %>% 
+  pmap(~left_join(.x, .y, by = "pegid")) %>% 
+  set_names("df_case_demo", "df_hhctrl_demo", "df_popctrl_demo") %>%
+  list2env(.GlobalEnv) %>% 
+  invisible()
+
+list(
+  list(df_case_demo, df_hhctrl_demo, df_popctrl_demo),
+  list("cases", "hhctrls", "popctrls")
+) %>% 
+  pmap(function(data, x){
+    data %>% 
+      filter(
+        !is.na(pegid)
+        & bloodstatus %in% c("Clinic - Successful", "Home Visit - Requested and Successful", 
+                           "By-mail Collection - Successful")
+        # | bloodstatus_v2 == 1
+        | !is.na(collect_date) 
+        | !is.na(phys_apptdate_status)
+      ) %>% 
+      mutate(across(
+        moca:lifehistory,
+        ~ if_else(is.na(.x), get(str_c(cur_column(), "_old")), .x),
+        .names = "{.col}"
+      )) %>% 
+      mutate_at(vars(moca:lifehistory), 
+                ~case_when(
+                  # is.na(.) & !is.na(mmse_peg2) & !is.na(lifehistory_peg2) 
+                  # & !is.na(gds_peg2) & !is.na(timeline_peg2) 
+                  # & !is.na(medicalchecklist_peg2) & !is.na(updrs_peg2) ~ "Entered in old database",
+                  is.na(.) & !is.na(peg3status1) ~ "Cannot complete",
+                  is.na(.) & screeningstatus %in% c("Eligible") ~ "Pending",
+                  (is.na(.) & is.na(peg3status1) & inpeg3 == "Not in PEG3") 
+                  | (is.na(.) & is.na(peg3status1) & !str_starts(pegid, "G")) ~ "Entered in old database",
+                  TRUE ~ .
+                )) 
+  }) %>% 
+  set_names("df_case_sample_entry", "df_hhctrl_sample_entry", 
+            "df_popctrl_sample_entry") %>% 
+  list2env(.GlobalEnv)
+
+list(
+  list(df_case_demo, df_hhctrl_demo, df_popctrl_demo),
+  list("cases", "hhctrls", "popctrls")
+) %>% 
+  pmap(function(data, x){
+    data %>% 
+      filter(
+        # !is.na(screeningstatus) 
+        bloodstatus %in% c("Clinic - Successful", "Home Visit - Requested and Successful", 
+                           "By-mail Collection - Successful")
+        # | bloodstatus_v2 == 1
+        & is.na(collect_date) 
+        # | !is.na(phys_apptdate_status)
+      ) %>% 
+      mutate_at(vars(moca:lifehistory), 
+                ~case_when(
+                  is.na(.) & !is.na(peg3status1) ~ "Cannot complete",
+                  is.na(.) & screeningstatus %in% c("Eligible") ~ "Pending",
+                  (is.na(.) & is.na(peg3status1) & inpeg3 == "Not in PEG3") 
+                  | (is.na(.) & is.na(peg3status1) & !str_starts(pegid, "G")) ~ "Entered in old database",
+                  TRUE ~ .
+                )) 
+  }) %>% 
+  set_names("df_case_blood_entry", "df_hhctrl_blood_entry", 
+            "df_popctrl_blood_entry") %>% 
+  list2env(.GlobalEnv)
+
+list(
+  list(df_case_demo, df_hhctrl_demo, df_popctrl_demo),
+  list("cases", "hhctrls", "popctrls")
+) %>% 
+  pmap(function(data, x){
+    data %>% 
+      filter(
+        # !is.na(screeningstatus) 
+        bloodstatus %notin% c("Clinic - Successful", "Home Visit - Requested and Successful", 
+                           "By-mail Collection - Successful")
+        # | bloodstatus_v2 == 1
+        & !is.na(collect_date) 
+        # | !is.na(phys_apptdate_status)
+      ) %>% 
+      mutate_at(vars(moca:lifehistory), 
+                ~case_when(
+                  is.na(.) & !is.na(peg3status1) ~ "Cannot complete",
+                  is.na(.) & screeningstatus %in% c("Eligible") ~ "Pending",
+                  (is.na(.) & is.na(peg3status1) & inpeg3 == "Not in PEG3") 
+                  | (is.na(.) & is.na(peg3status1) & !str_starts(pegid, "G")) ~ "Entered in old database",
+                  TRUE ~ .
+                )) 
+  }) %>% 
+  set_names("df_case_stool_entry", "df_hhctrl_stool_entry", 
+            "df_popctrl_stool_entry") %>% 
+  list2env(.GlobalEnv)
+
+
+list(
+  list(df_case_demo, df_hhctrl_demo, df_popctrl_demo),
+  list("cases", "hhctrls", "popctrls")
+) %>% 
+  pmap(function(data, x){
+    data %>% 
+      filter(
+        # !is.na(screeningstatus) 
+        bloodstatus %in% c("Clinic - Successful", "Home Visit - Requested and Successful", 
+                              "By-mail Collection - Successful")
+        # | bloodstatus_v2 == 1
+        & !is.na(collect_date) 
+        # | !is.na(phys_apptdate_status)
+      ) %>% 
+      mutate_at(vars(moca:lifehistory), 
+                ~case_when(
+                  is.na(.) & !is.na(peg3status1) ~ "Cannot complete",
+                  is.na(.) & screeningstatus %in% c("Eligible") ~ "Pending",
+                  (is.na(.) & is.na(peg3status1) & inpeg3 == "Not in PEG3") 
+                  | (is.na(.) & is.na(peg3status1) & !str_starts(pegid, "G")) ~ "Entered in old database",
+                  TRUE ~ .
+                )) 
+  }) %>% 
+  set_names("df_case_blood_stool_entry", "df_hhctrl_blood_stool_entry", 
+            "df_popctrl_blood_stool_entry") %>% 
+  list2env(.GlobalEnv)
+
+
+list(
+  list(df_case_demo, df_hhctrl_demo, df_popctrl_demo),
+  list("cases", "hhctrls", "popctrls")
+) %>% 
+  pmap(function(data, x){
+    data %>% 
+      filter(
+        screeningstatus %in% c("Eligible")
+        & bloodstatus %notin% c("Clinic - Successful", "Home Visit - Requested and Successful", 
+                           "By-mail Collection - Successful")
+        # | bloodstatus_v2 == 1
+        & is.na(collect_date) 
+        # | !is.na(phys_apptdate_status)
+      ) %>% 
+      mutate_at(vars(moca:lifehistory), 
+                ~case_when(
+                  is.na(.) & !is.na(peg3status1) ~ "Cannot complete",
+                  is.na(.) & screeningstatus %in% c("Eligible") ~ "Pending",
+                  (is.na(.) & is.na(peg3status1) & inpeg3 == "Not in PEG3") 
+                  | (is.na(.) & is.na(peg3status1) & !str_starts(pegid, "G")) ~ "Entered in old database",
+                  TRUE ~ .
+                )) 
+  }) %>% 
+  set_names("df_case_nosample_eligible_entry", "df_hhctrl_nosample_eligible_entry", 
+            "df_popctrl_nosample_eligible_entry") %>% 
+  list2env(.GlobalEnv)
+
+# setdiff(tbl_peg3_fecal_popctrl$pegid, df_popctrl_sample_entry$pegid)
+
+
+list(
+  list(df_case_sample_entry, df_hhctrl_sample_entry, df_popctrl_sample_entry),
+  c("peg3 case", "peg3 hhctrl", "peg3 popctrl")
+) %>% 
+  pmap(function(data1, data2){
+    data1 %>% 
+      select(pegid, moca:lifehistory) %>% 
+      rename(`moca/mmse` = moca) %>% 
+      mutate_all(~replace(.x, is.na(.), 
+                          "Pending")) %>%
+      pivot_longer(
+        cols = !pegid,
+        names_to = "form",
+        values_to = "entry_status"
+      ) %>% 
+      ggplot(aes(x = form, fill = entry_status)) + 
+      geom_bar()+
+      geom_text(stat = "count", aes(label = after_stat(count)), 
+                position = position_stack(vjust = 0.5))+
+      # geom_col(position = "fill") +
+      scale_fill_manual(values = c(
+        "Entry completed" = "#8BC496",
+        "Entered in old database" = "#CADE9A",
+        "Pending" = "#CEC289",
+        "Cannot complete" = "#bbbbbb",
+        "Entry needed" = "#E9B3AD",
+        "Entry date needed" ="#D6B1CB",
+        "Entry initial needed" = "#ADBFD9",
+        "Partially completed" = "#F2D7D5"
+      )) +
+      coord_flip() +
+      labs(title =  str_c(
+        Sys.Date(), " " ,data2,
+        " entry tracking (N = ", nrow(data1), ")"),
+        fill = "Entry status",
+        y = "Count",
+        x = "Form") +
+      theme(
+        axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 12, hjust = 0.5)
+      )
+  }) %>% 
+  set_names("Cases", "Household Controls", "Population Controls")
+
+
+list(
+  list(df_case_blood_entry, df_hhctrl_blood_entry, df_popctrl_blood_entry),
+  c("peg3 case", "peg3 hhctrl", "peg3 popctrl")
+) %>% 
+  pmap(function(data1, data2){
+    data1 %>% 
+      select(pegid, moca:lifehistory) %>% 
+      mutate_all(~replace(.x, is.na(.), 
+                          "Pending")) %>%
+      pivot_longer(
+        cols = !pegid,
+        names_to = "form",
+        values_to = "entry_status"
+      ) %>% 
+      ggplot(aes(x = form, fill = entry_status)) + 
+      geom_bar()+
+      geom_text(stat = "count", aes(label = after_stat(count)), 
+                position = position_stack(vjust = 0.5))+
+      # geom_col(position = "fill") +
+      scale_fill_manual(values = c(
+        "Entry completed" = "#8BC496",
+        "Entered in old database" = "#CADE9A",
+        "Pending" = "#CEC289",
+        "Cannot complete" = "#bbbbbb",
+        "Entry needed" = "#E9B3AD",
+        "Entry date needed" ="#D6B1CB",
+        "Entry initial needed" = "#ADBFD9",
+        "Partially completed" = "#F2D7D5"
+      )) +
+      coord_flip() +
+      labs(title =  str_c(
+        Sys.Date(), " " ,data2,
+        " entry tracking (N = ", nrow(data1), ")", " (blood only)"),
+        fill = "Entry status",
+        y = "Count",
+        x = "Form") +
+      theme(
+        axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 12, hjust = 0.5)
+      )
+  }) %>% 
+  set_names("Cases", "Household Controls", "Population Controls")
+
+# list(df_case_new, df_hhctrl_new, df_popctrl_new) %>% 
+#   map(function(data){
+#     data %>% 
+#       mutate(peg_status_new = case_when(
+#         !is.na(peg3status1) ~ peg3status1,
+#         is.na(peg3status1) & screeningstatus != "Already in PEG" ~ screeningstatus,
+#         screeningstatus == "Already in PEG" & !is.na(incidentid_index) ~ "In prog",
+#         is.na(consent_date) & !is.na(enroll_date) ~ "Haven't been consented",
+#         TRUE ~ "pending"
+#       )
+#       )
+#   }) %>% 
+#   set_names("df_case_new", "df_hhctrl_new", "df_popctrl_new") %>% 
+#   list2env(.GlobalEnv)
+
+# data availability for all contacted participants
+# list(df_case_new, df_hhctrl_new, df_popctrl_new) %>% 
+#   map(function(data){
+#     data %>% 
+#       ggplot(aes(x = form_completion_new,fill = form_completion_new)) +
+#       geom_bar() +
+#       geom_text(stat = "count", aes(label = after_stat(count)), 
+#                 position = position_stack(vjust = 0.5)) +
+#       scale_fill_manual(values = c("Completed something" = "#8BC496",
+#                                    "Completed nothing" = "#CEC289")) +
+#       labs(title = str_c(Sys.Date(), " ", "Item completion tracking"),
+#            x = "Item completion status",
+#            y = "Count") +
+#       theme(
+#         axis.text.x = element_text(size = 12),
+#         axis.text.y = element_text(size = 12),
+#         axis.title = element_text(size = 14),
+#         plot.title = element_text(size = 12, hjust = 0.5)
+#       )
+#   }) %>% 
+#   set_names("Cases", "Household Controls", "Population Controls")
+
+# participants who completed nothing
+# list(df_case_new, df_hhctrl_new, df_popctrl_new) %>% 
+#   map(function(data){
+#     data %>% 
+#       filter(form_completion_new == "Completed nothing")
+#   }) %>% 
+#   set_names("df_case_nothing", "df_hhctrl_nothing", 
+#             "df_popctrl_nothing") %>%
+#   list2env(.GlobalEnv)
+# 
+# list(df_case_nothing, df_hhctrl_nothing, df_popctrl_nothing) %>% 
+#   map(function(data){
+#     data %>% 
+#       ggplot(aes(x = peg_status_new)) +
+#       geom_bar(fill = "lightblue") +
+#       geom_text(stat = "count", aes(label = after_stat(count)), 
+#                 position = position_stack(vjust = 0.5)) +
+#       labs(title = str_c(Sys.Date(), " ", "Participant status tracking (who completed nothing)"),
+#            x = "Participant status",
+#            y = "Count") +
+#       theme(
+#         axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+#         axis.text.y = element_text(size = 12),
+#         axis.title = element_text(size = 14),
+#         plot.title = element_text(size = 12, hjust = 0.5)
+#       )
+#   }) %>% 
+#   set_names("Cases", "Household Controls", "Population Controls")
+
+# participants who completed something
+# list(df_case_new, df_hhctrl_new, df_popctrl_new) %>% 
+#   map(function(data){
+#     data %>% 
+#       filter(form_completion_new == "Completed something") %>% 
+#       mutate_at(vars(moca:lifehistory), ~case_when(
+#         !is.na(.) ~ .,
+#         is.na(.) & 
+#           peg_status_new %in% c("Deceased", "Too ill", 
+#                                 "Do not contact", 
+#                                 "Not lived in Fresno, Kern or Tulare",
+#                                 "Withdrew / can use information") ~ "Cannot complete",
+#         TRUE ~ "Pending/Need to update RA checklist"
+#       ))
+#   }) %>% 
+#   set_names("df_case_something", "df_hhctrl_something", 
+#             "df_popctrl_something") %>%
+#   list2env(.GlobalEnv)
+
+# baseline participants 
+list(df_case, df_hhctrl_new, df_popctrl_new) %>% 
+  map(function(data){
+    data %>% 
+      filter(str_starts(pegid, "G")) 
+  }) %>% 
+  set_names("df_case_baseline", "df_hhctrl_baseline", 
+            "df_popctrl_baseline") %>%
+  list2env(.GlobalEnv)
+
+# baseline participants with any sample or neuro
+list(df_case_baseline, df_hhctrl_baseline, df_popctrl_baseline) %>% 
+  map(function(data){
+    data %>% 
+      filter(bloodstatus %in% c("Clinic - Successful", 
+                                "Home Visit - Requested and Successful", 
+                                "By-mail Collection - Successful") | 
+               stoolstatus %in% c("Clinic - Successful", 
+                                  "Home Visit - Requested and Successful", 
+                                  "By-mail Collection - Successful") | 
+               phys_apptdate_status == "Yes")
+  }) %>% 
+  set_names("df_case_baseline_sample_neuro", "df_hhctrl_baseline_sample_neuro", 
+            "df_popctrl_baseline_sample_neuro") %>%
+  list2env(.GlobalEnv)
+
+# follow-up participants
+list(df_case, df_hhctrl_new, df_popctrl_new) %>% 
+  map(function(data){
+    data %>% 
+      filter(!str_starts(pegid, "G")) 
+  }) %>% 
+  set_names("df_case_prog", "df_hhctrl_prog", 
+            "df_popctrl_prog") %>%
+  list2env(.GlobalEnv)
+
+# follow-up participants with any sample or neuro
+list(df_case_prog, df_hhctrl_prog, df_popctrl_prog) %>% 
+  map(function(data){
+    data %>% 
+      filter(bloodstatus %in% c("Clinic - Successful", 
+                                "Home Visit - Requested and Successful", 
+                                "By-mail Collection - Successful") | 
+               stoolstatus %in% c("Clinic - Successful", 
+                                  "Home Visit - Requested and Successful", 
+                                  "By-mail Collection - Successful") | 
+               phys_apptdate_status == "Yes")
+  }) %>% 
+  set_names("df_case_prog_sample_neuro", "df_hhctrl_prog_sample_neuro", 
+            "df_popctrl_prog_sample_neuro") %>%
+  list2env(.GlobalEnv)
+
+#plotting
+
+# all contacted participants
+plotlist <- list(
+  list(df_case_something, df_hhctrl_something, df_popctrl_something),
+  c("peg3 case", "peg3 hhctrl", "peg3 popctrl")
+) %>% 
+  pmap(function(data1, data2){
+    data1 %>% 
+      select(pegid, moca:lifehistory) %>% 
+      mutate_all(~replace(.x, is.na(.), 
+                          "Pending/Need to update RA checklist")) %>%
+      pivot_longer(
+        cols = !pegid,
+        names_to = "form",
+        values_to = "entry_status"
+      ) %>% 
+      ggplot(aes(x = form, fill = entry_status)) + 
+      geom_bar()+
+      geom_text(stat = "count", aes(label = after_stat(count)), 
+                position = position_stack(vjust = 0.5))+
+      # geom_col(position = "fill") +
+      scale_fill_manual(values = c(
+        "Entry completed" = "#8BC496",
+        "Pending/Need to update RA checklist" = "#CEC289",
+        "Cannot complete" = "#bbbbbb",
+        "Entry needed" = "#E9B3AD",
+        "Entry date needed" ="#D6B1CB",
+        "Entry initial needed" = "#ADBFD9",
+        "Partially completed" = "#F2D7D5"
+      )) +
+      coord_flip() +
+      labs(title =  str_c(
+        Sys.Date(), " " ,data2,
+        " entry tracking (N = ", nrow(data1), ")"),
+        fill = "Entry status",
+        y = "Count",
+        x = "Form") +
+      theme(
+        axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 12, hjust = 0.5)
+      )
+  })
+
+plotlist
+
+# baseline participants
+plotlist <- list(
+  list(df_case_baseline, df_hhctrl_baseline, df_popctrl_baseline),
+  c("peg3 baseline case", "peg3 baseline hhctrl", "peg3 baseline popctrl")
+) %>% 
+  pmap(function(data1, data2){
+    data1 %>% 
+      select(pegid, moca:lifehistory) %>% 
+      mutate_all(~replace(.x, is.na(.), 
+                          "Pending/Need to update RA checklist")) %>%
+      pivot_longer(
+        cols = !pegid,
+        names_to = "form",
+        values_to = "entry_status"
+      ) %>% 
+      ggplot(aes(x = form, fill = entry_status)) + 
+      geom_bar()+
+      geom_text(stat = "count", aes(label = after_stat(count)), 
+                position = position_stack(vjust = 0.5))+
+      # geom_col(position = "fill") +
+      scale_fill_manual(values = c(
+        "Entry completed" = "#8BC496",
+        "Pending/Need to update RA checklist" = "#CEC289",
+        "Cannot complete" = "#bbbbbb",
+        "Entry needed" = "#E9B3AD",
+        "Entry date needed" ="#D6B1CB",
+        "Entry initial needed" = "#ADBFD9",
+        "Partially completed" = "#F2D7D5"
+      )) +
+      coord_flip() +
+      labs(title =  str_c(
+        Sys.Date(), " " ,data2,
+        " entry tracking (N = ", nrow(data1), ")"),
+        fill = "Entry status",
+        y = "Count",
+        x = "Form") +
+      theme(
+        axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 12, hjust = 0.5)
+      )
+  })
+
+plotlist
+
+# follow-up participants
+plotlist <- list(
+  list(df_case_prog, df_hhctrl_prog, df_popctrl_prog),
+  c("pegprog case", "pegprog hhctrl", "pegprog popctrl")
+) %>% 
+  pmap(function(data1, data2){
+    data1 %>% 
+      select(pegid, moca:lifehistory) %>% 
+      mutate_all(~replace(.x, is.na(.), 
+                          "Pending/Need to update RA checklist")) %>%
+      pivot_longer(
+        cols = !pegid,
+        names_to = "form",
+        values_to = "entry_status"
+      ) %>% 
+      ggplot(aes(x = form, fill = entry_status)) + 
+      geom_bar()+
+      geom_text(stat = "count", aes(label = after_stat(count)), 
+                position = position_stack(vjust = 0.5))+
+      # geom_col(position = "fill") +
+      scale_fill_manual(values = c(
+        "Entry completed" = "#8BC496",
+        "Pending/Need to update RA checklist" = "#CEC289",
+        "Cannot complete" = "#bbbbbb",
+        "Entry needed" = "#E9B3AD",
+        "Entry date needed" ="#D6B1CB",
+        "Entry initial needed" = "#ADBFD9",
+        "Partially completed" = "#F2D7D5"
+      )) +
+      coord_flip() +
+      labs(title =  str_c(
+        Sys.Date(), " " ,data2,
+        " entry tracking (N = ", nrow(data1), ")"),
+        fill = "Entry status",
+        y = "Count",
+        x = "Form") +
+      theme(
+        axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 12, hjust = 0.5)
+      )
+  }) 
+
+plotlist
+
+# plotlist <- list(
+#   list(tbl_peg3_case_tracking_wide, tbl_peg3_hhctrl_tracking_wide,
+#        tbl_peg3_popctrl_tracking_wide),
+#   list(tbl_PEG3_active_case, tbl_PEG3_active_hhctrl,
+#        tbl_PEG3_active_popctrl),
+#   c("peg3 case", "peg3 hhctrl", "peg3 popctrl")
+# ) %>% 
+#   pmap(function(data1, data2, data3){
+#     data1 %>% 
+#       right_join(data2, by = "pegid") %>% 
+#       select(matches(c("moca", "gds", "medicalchecklist", "updrs", "pegid", "occupation", "residence"))) %>%
+#       # mutate_at(vars(form), ~ replace(.x, .x %in% list("main_followup"), 
+#       #                                 "main interview")) %>% 
+#       # filter(form %in% c("moca", "gds", "medicalchecklist", "updrs")) %>% 
+#       # group_by(pegid, form) %>% 
+#       # arrange(pegid, entry_status) %>% 
+#       # slice(1) %>% 
+#       # ungroup() %>% 
+#       # pivot_wider(
+#       #   id_cols = pegid,
+#       #   names_from = form,
+#       #   values_from = entry_status
+#       # ) %>%
+#       # select(-matches("NA")) %>% 
+#       mutate_all(~replace(.x, is.na(.), 
+#                           "Pending/Need to update RA checklist")) %>%
+#       pivot_longer(
+#         cols = !pegid,
+#         names_to = "form",
+#         values_to = "entry_status"
+#       ) %>% 
+#       # count(form, entry_status) %>%
+#       # group_by(form) %>% 
+#       # mutate(pct = prop.table(n)*100) %>% 
+#       ggplot(aes(x = form, fill = entry_status)) + 
+#       geom_bar()+
+#       geom_text(stat = "count", aes(label = after_stat(count)), 
+#                 position = position_stack(vjust = 0.5))+
+#       # geom_col(position = "fill") +
+#       scale_fill_manual(values = c(
+#         "Entry completed" = "#8BC496",
+#         "Pending/Need to update RA checklist" = "#CEC289",
+#         "Not completed" = "#bbbbbb",
+#         "Entry needed" = "#E9B3AD",
+#         "Entry date needed" ="#D6B1CB",
+#         "Entry initial needed" = "#ADBFD9"
+#       )) +
+#       coord_flip() +
+#       labs(title =  str_c(
+#         Sys.Date(), " " ,data3,
+#         " entry tracking (N = ", nrow(data2), ")"),
+#         fill = "Entry status",
+#         y = "Count",
+#         x = "Form") +
+#       theme(
+#         axis.text.y = element_text(size = 12),
+#         axis.text.x = element_text(size = 12),
+#         axis.title = element_text(size = 14),
+#         plot.title = element_text(size = 12, hjust = 0.5)
+#       )
+#   })
+# 
+# plotlist
+
+png(file=here("figures", "peg3_entry_tracking_withprog_new_priority.png"), 
+    width = 2560, height = 1440, units = "px", res = 150)
+ggarrange(plotlist = plotlist,
+          ncol = 3, nrow = 1,
+          common.legend = T,
+          legend = "bottom")
+dev.off()
+
+
+# track demographics/ # did entry1 and entry2/ consistency check
+# unmerge the screeningstatus and peg3status1: we expect different data for these status
+# enroll_date and consent_date: make sure people without enroll_date have refused
+# 
+
